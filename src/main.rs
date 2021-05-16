@@ -1,4 +1,6 @@
+use std::convert::TryInto;
 use structopt::StructOpt;
+use std::path::PathBuf;
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 struct EmojiAdminList {
@@ -24,6 +26,21 @@ struct Emoji {
 
     #[serde(flatten)]
     unknown_fields: UnknownJSONFields,
+}
+
+impl Emoji {
+    pub fn new(name: &str) -> Emoji {
+        Emoji {
+            name: name.to_string(),
+            is_alias: 0,
+            alias_for: "".into(),
+            url: "https://cdn.example.com/emoji.png".into(),
+            created: 133742069,
+            user_display_name: "M3t0r".into(),
+            avatar_hash: "0xdeadbeef".into(),
+            unknown_fields: UnknownJSONFields::new(),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
@@ -121,9 +138,8 @@ fn get_emoji(workspace: String, token: String) -> Result<Vec<Emoji>, GetEmojiErr
 ///
 /// Lists all emoji in a workspace by default
 struct Cli {
-    /// Change to path before any operation
-    #[structopt(short = "C", long = "directory", name = "path", parse(from_os_str))]
-    change: Option<std::path::PathBuf>,
+    #[structopt(flatten)]
+    global: GlobalOptions,
 
     #[structopt(subcommand)]
     command: Commands,
@@ -139,6 +155,9 @@ enum Commands {
 
 #[derive(StructOpt, Debug)]
 struct ListOptions {
+    #[structopt(flatten)]
+    global: GlobalOptions,
+
     /// The workspace to list emoji for
     ///
     /// This is usually the subodmain like: https://<workspace>.slack.com
@@ -151,32 +170,79 @@ struct ListOptions {
     #[structopt(long, env = "SLACK_TOKEN", hide_env_values = true)]
     token: String,
 
-    /// Output to STDOUT as JSON values separated by newlines instead of writing to files
+    /// Where to write the JSON data to
+    ///
+    /// Directory or file path. Can be '-' to use STDOUT as file. Defaults to a directory with the same name as the workspace.
     #[structopt(long)]
-    stdout: bool,
+    output: Option<PathBuf>,
+}
+
+#[derive(StructOpt, Debug)]
+struct GlobalOptions {
+    /// Be verbose
+    #[structopt(long,short)]
+    verbose: bool,
+}
+
+impl std::ops::Add for GlobalOptions {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            verbose: self.verbose || rhs.verbose,
+        }
+    }
+}
+
+enum FileOrDirectoryWriter {
+    File(Box<dyn std::io::Write>),
+    Directory(PathBuf),
+}
+
+impl FileOrDirectoryWriter {
+    pub fn write(&mut self, name: &String, serialized: String) -> std::io::Result<usize> {
+        match self {
+            FileOrDirectoryWriter::File(ref mut writer) => writer.write((serialized + "\n").as_bytes()),
+            FileOrDirectoryWriter::Directory(dir) => todo!(),
+        }
+    }
 }
 
 fn main() {
-    let opt = Cli::from_args();
+    let opts = Cli::from_args();
 
-    match opt.command {
+    match opts.command {
         Commands::List(list_opts) => {
-            let emoji = match get_emoji(list_opts.workspace, list_opts.token) {
+            let global_opts = list_opts.global + opts.global;
+
+            /*let emoji = match get_emoji(list_opts.workspace, list_opts.token) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("Could not get emojis: {}", e);
                     std::process::exit(1);
                 }
+            };*/
+            let emoji: Vec<Emoji> = vec![Emoji::new("blub"), Emoji::new("blab")];
+
+            let mut ford_writer = match list_opts.output {
+                None => FileOrDirectoryWriter::File(Box::new(std::io::stdout())),
+                Some(p) if p == PathBuf::from("-") => FileOrDirectoryWriter::File(Box::new(std::io::stdout())),
+                Some(path) => FileOrDirectoryWriter::Directory(path), 
             };
 
-            for e in &emoji {
-                eprintln!("{} -> {}", e.name, e.url);
-                match serde_json::to_string_pretty(&e) {
-                    Ok(json) => println!("{}", json),
-                    Err(error) => eprintln!("Could not serialize: {}: {:?}", error, e),
+            let pb = indicatif::ProgressBar::new(emoji.len().try_into().unwrap_or(std::u64::MAX));
+            for e in pb.wrap_iter(emoji.iter()) {
+                if global_opts.verbose {
+                    pb.println(format!("{} -> {}", e.name, e.url));
+                }
+                match serde_json::to_string_pretty(e) {
+                    Ok(s) => match ford_writer.write(&e.name, s) {
+                        Ok(_) => (),
+                        Err(error) => pb.println(format!("{}: Could not write: {}", e.name, error)),
+                    },
+                    Err(error) => pb.println(format!("{}: Could not serialize: {}: {:?}", e.name, error, e)),
                 };
             }
-            eprintln!("Done! {} emoji in total", emoji.len());
+            pb.finish_with_message(format!("Done! {} emoji in total", emoji.len()));
         }
         Commands::Download => {
             todo!()
