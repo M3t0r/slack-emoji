@@ -1,7 +1,9 @@
+use reqwest::blocking::Client;
 use std::convert::TryInto;
-use std::fs::{File, OpenOptions};
+use std::fs::{read, read_dir, remove_file, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use structopt::StructOpt;
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
@@ -81,12 +83,11 @@ impl From<reqwest::Error> for GetEmojiError {
     }
 }
 
-fn get_emoji(workspace: String, token: String) -> Result<Vec<Emoji>, GetEmojiError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent(format!("m3t0r/slack-emoji ({})", env!("CARGO_PKG_VERSION")))
-        .build()?;
-
+fn get_emoji(
+    client: Client,
+    workspace: String,
+    token: String,
+) -> Result<Vec<Emoji>, GetEmojiError> {
     let req = client
         .post(format!(
             "https://{}.slack.com/api/emoji.adminList",
@@ -150,7 +151,7 @@ enum Commands {
     /// Lists all custom emoji in a workspace
     List(ListOptions),
     /// Downloads all emoji images and metadata and store them in a folder
-    Download,
+    Download(DownloadOptions),
 }
 
 #[derive(StructOpt, Debug)]
@@ -175,6 +176,19 @@ struct ListOptions {
     /// Directory or file path. Can be '-' to use STDOUT as file. Defaults to a directory with the same name as the workspace.
     #[structopt(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(StructOpt, Debug)]
+struct DownloadOptions {
+    #[structopt(flatten)]
+    global: GlobalOptions,
+
+    /// Force download of already downloaded emojis
+    #[structopt(short, long)]
+    force: bool,
+
+    #[structopt()]
+    path: PathBuf,
 }
 
 #[derive(StructOpt, Debug)]
@@ -213,9 +227,10 @@ impl FileOrDirectoryWriter {
                     std::fs::create_dir_all(&dir)?;
                 }
                 let content_size = serialized.len();
-                let mut file_path = dir.join(name);
-                file_path.set_extension("json");
-                std::fs::write(file_path, (serialized + "\n").as_bytes())?;
+                std::fs::write(
+                    dir.join(name).with_extension("json"),
+                    (serialized + "\n").as_bytes(),
+                )?;
                 Ok(content_size + 1)
             }
         }
@@ -242,6 +257,16 @@ impl std::convert::TryFrom<PathBuf> for FileOrDirectoryWriter {
 }
 
 fn main() {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(format!("m3t0r/slack-emoji ({})", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap();
+
+    let pb_style = indicatif::ProgressStyle::default_bar().template(
+        "{wide_bar} {pos}/{len:.dim} [{eta} left] {msg:<25!}",
+    );
+
     let opts = Cli::from_args();
 
     match opts.command {
@@ -260,7 +285,7 @@ fn main() {
                 }
             };
 
-            let emoji = match get_emoji(list_opts.workspace, list_opts.token) {
+            let emoji = match get_emoji(client, list_opts.workspace, list_opts.token) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("Could not get emojis: {}", e);
@@ -269,7 +294,7 @@ fn main() {
             };
             // let emoji: Vec<Emoji> = vec![Emoji::new("blub"), Emoji::new("blab")];
 
-            let pb = indicatif::ProgressBar::new(emoji.len().try_into().unwrap_or(std::u64::MAX));
+            let pb = indicatif::ProgressBar::new(emoji.len() as u64).with_style(pb_style);
             for e in pb.wrap_iter(emoji.iter()) {
                 if global_opts.verbose {
                     pb.println(format!("{} -> {}", e.name, e.url));
@@ -287,8 +312,93 @@ fn main() {
             }
             pb.finish_with_message(format!("Done! {} emoji in total", emoji.len()));
         }
-        Commands::Download => {
-            todo!()
+        Commands::Download(download_opts) => {
+            let global_opts = download_opts.global + opts.global;
+
+            if !download_opts.path.exists() {
+                eprintln!("Specified path does not exist: {:?}", download_opts.path);
+                std::process::exit(1);
+            }
+
+            let emoji_iter: Box<dyn std::iter::Iterator<Item = Emoji>> = Box::new(
+                read_dir(download_opts.path.clone())
+                    .unwrap_or_else(|e| {
+                        eprintln!("could not read json files from directory: {:?}", e);
+                        std::process::exit(2);
+                    })
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.path().is_file()) // no sub-dirs
+                    .filter(|entry| {
+                        entry.path().extension() // only JSON files
+                        == Some(std::ffi::OsStr::new("json"))
+                    })
+                    .filter_map(|entry| read(entry.path()).ok())
+                    .map(|bytes| serde_json::from_slice(&bytes))
+                    .filter_map(|maybe_emoji| match maybe_emoji {
+                        Err(e) => {
+                            eprintln!("Could not parse JSON: {:?}", e);
+                            None
+                        }
+                        Ok(emoji) => Some(emoji),
+                    }),
+            );
+
+            let base_path = download_opts.path;
+            let url_path_pairs: Vec<(String, PathBuf)> = emoji_iter
+                .map(|e| {
+                    (e.url.clone(), {
+                        let (_, suffix) = e.url.rsplit_once('.').unwrap_or(("", "png"));
+                        base_path.join(e.name).with_extension(suffix)
+                    })
+                })
+                .collect();
+
+            let pb = indicatif::ProgressBar::new(url_path_pairs.len() as u64).with_style(pb_style);
+
+            let min_dif: Duration = Duration::from_secs(1) / 20; // 20 dls / s
+            let mut last_dl = Instant::now();
+
+            for (url, path) in pb.wrap_iter(url_path_pairs.iter()) {
+                if !download_opts.force && path.is_file() {
+                    continue; // skip downloaded files
+                }
+                pb.set_message(path.to_string_lossy().to_string().clone());
+                if global_opts.verbose {
+                    pb.println(format!("Downloading {}", url));
+                }
+
+                let bytes = client
+                    .get(url)
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .and_then(|res| res.error_for_status())
+                    .and_then(|res| res.bytes());
+                if bytes.is_err() {
+                    pb.println(format!(
+                        "Could not request {:?}: {}",
+                        path,
+                        bytes.unwrap_err()
+                    ));
+                    continue;
+                };
+
+                match std::fs::write(path, bytes.unwrap().as_ref()) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        pb.println(format!("Could not write to {:?}: {}", path, e));
+
+                        if path.is_file() {
+                            remove_file(path).ok();
+                        }
+                    }
+                }
+
+                let next_dl = last_dl + min_dif;
+                std::thread::sleep(next_dl.saturating_duration_since(Instant::now()));
+                last_dl = next_dl;
+            }
+
+            pb.finish_with_message("All done");
         }
     }
 }
