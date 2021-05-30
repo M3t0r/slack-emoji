@@ -1,6 +1,8 @@
 use std::convert::TryInto;
-use structopt::StructOpt;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
+use structopt::StructOpt;
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 struct EmojiAdminList {
@@ -29,6 +31,7 @@ struct Emoji {
 }
 
 impl Emoji {
+    #[allow(dead_code)]
     pub fn new(name: &str) -> Emoji {
         Emoji {
             name: name.to_string(),
@@ -81,10 +84,7 @@ impl From<reqwest::Error> for GetEmojiError {
 fn get_emoji(workspace: String, token: String) -> Result<Vec<Emoji>, GetEmojiError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(format!(
-            "m3t0r/slack-emoji ({})",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(format!("m3t0r/slack-emoji ({})", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     let req = client
@@ -180,7 +180,7 @@ struct ListOptions {
 #[derive(StructOpt, Debug)]
 struct GlobalOptions {
     /// Be verbose
-    #[structopt(long,short)]
+    #[structopt(long, short)]
     verbose: bool,
 }
 
@@ -194,15 +194,49 @@ impl std::ops::Add for GlobalOptions {
 }
 
 enum FileOrDirectoryWriter {
-    File(Box<dyn std::io::Write>),
+    StdOut,
+    File(File),
     Directory(PathBuf),
 }
 
 impl FileOrDirectoryWriter {
     pub fn write(&mut self, name: &String, serialized: String) -> std::io::Result<usize> {
         match self {
-            FileOrDirectoryWriter::File(ref mut writer) => writer.write((serialized + "\n").as_bytes()),
-            FileOrDirectoryWriter::Directory(dir) => todo!(),
+            FileOrDirectoryWriter::StdOut => {
+                std::io::stdout().write((serialized + "\n").as_bytes())
+            }
+            FileOrDirectoryWriter::File(ref mut writer) => {
+                writer.write((serialized + "\n").as_bytes())
+            }
+            FileOrDirectoryWriter::Directory(dir) => {
+                if !dir.exists() {
+                    std::fs::create_dir_all(&dir)?;
+                }
+                let content_size = serialized.len();
+                let mut file_path = dir.join(name);
+                file_path.set_extension("json");
+                std::fs::write(file_path, (serialized + "\n").as_bytes())?;
+                Ok(content_size + 1)
+            }
+        }
+    }
+}
+
+impl std::convert::TryFrom<PathBuf> for FileOrDirectoryWriter {
+    type Error = std::io::Error;
+    fn try_from(pf: PathBuf) -> std::io::Result<Self> {
+        if pf == PathBuf::from("-") {
+            Ok(FileOrDirectoryWriter::StdOut)
+        } else if pf.is_dir() || pf.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
+            Ok(FileOrDirectoryWriter::Directory(pf))
+        } else {
+            Ok(FileOrDirectoryWriter::File(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(pf)?,
+            ))
         }
     }
 }
@@ -214,20 +248,26 @@ fn main() {
         Commands::List(list_opts) => {
             let global_opts = list_opts.global + opts.global;
 
-            /*let emoji = match get_emoji(list_opts.workspace, list_opts.token) {
+            let mut ford_writer: FileOrDirectoryWriter = match list_opts
+                .output
+                .unwrap_or(PathBuf::from(list_opts.workspace.clone() + "/"))
+                .try_into()
+            {
+                Ok(ford_writer) => ford_writer,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(2);
+                }
+            };
+
+            let emoji = match get_emoji(list_opts.workspace, list_opts.token) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("Could not get emojis: {}", e);
                     std::process::exit(1);
                 }
-            };*/
-            let emoji: Vec<Emoji> = vec![Emoji::new("blub"), Emoji::new("blab")];
-
-            let mut ford_writer = match list_opts.output {
-                None => FileOrDirectoryWriter::File(Box::new(std::io::stdout())),
-                Some(p) if p == PathBuf::from("-") => FileOrDirectoryWriter::File(Box::new(std::io::stdout())),
-                Some(path) => FileOrDirectoryWriter::Directory(path), 
             };
+            // let emoji: Vec<Emoji> = vec![Emoji::new("blub"), Emoji::new("blab")];
 
             let pb = indicatif::ProgressBar::new(emoji.len().try_into().unwrap_or(std::u64::MAX));
             for e in pb.wrap_iter(emoji.iter()) {
@@ -239,13 +279,128 @@ fn main() {
                         Ok(_) => (),
                         Err(error) => pb.println(format!("{}: Could not write: {}", e.name, error)),
                     },
-                    Err(error) => pb.println(format!("{}: Could not serialize: {}: {:?}", e.name, error, e)),
+                    Err(error) => pb.println(format!(
+                        "{}: Could not serialize: {}: {:?}",
+                        e.name, error, e
+                    )),
                 };
             }
             pb.finish_with_message(format!("Done! {} emoji in total", emoji.len()));
         }
         Commands::Download => {
             todo!()
+        }
+    }
+}
+
+#[cfg(test)]
+mod ford_tests {
+    use super::*;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dash() {
+        let ford: FileOrDirectoryWriter = PathBuf::from("-")
+            .try_into()
+            .expect("could not create writer");
+        test_stdout(ford);
+    }
+
+    fn test_stdout(mut ford: FileOrDirectoryWriter) {
+        assert!(match ford {
+            FileOrDirectoryWriter::StdOut => true,
+            _ => false,
+        });
+        assert_eq!(
+            ford.write(&"stdout-test".to_string(), "test output".to_string())
+                .expect("could not write"),
+            12usize // 11 chars + 1 newline
+        );
+    }
+
+    #[test]
+    fn file() {
+        let mut ford: FileOrDirectoryWriter = PathBuf::from("test-file")
+            .try_into()
+            .expect("could not create writer");
+        assert_eq!(
+            ford.write(&"file-test".to_string(), "test output".to_string())
+                .expect("could not write test data"),
+            12usize
+        );
+        assert_eq!(
+            std::fs::read("test-file").expect("could not read test data to verify"),
+            "test output\n".as_bytes()
+        );
+        std::fs::remove_file("test-file").expect("could not clean up test file");
+    }
+
+    #[test]
+    fn dir_with_slash() {
+        let dir = TestDir::new("test-dir/");
+        let ford: FileOrDirectoryWriter = PathBuf::from(dir.path)
+            .try_into()
+            .expect("could not create writer");
+        test_dir(ford, dir.path);
+    }
+
+    #[test]
+    fn dir_with_existing_dir() {
+        let dir = TestDir::new("existing-test-dir");
+        std::fs::create_dir(dir.path)
+            .expect("could not create test directory to test with an existing dir");
+
+        let ford: FileOrDirectoryWriter = PathBuf::from(dir.path)
+            .try_into()
+            .expect("could not create writer");
+        test_dir(ford, dir.path);
+
+        std::fs::remove_dir_all(dir.path).unwrap();
+    }
+
+    fn test_dir(mut ford: FileOrDirectoryWriter, path: &Path) {
+        assert!(ford.write(&"test-a".into(), "foo".into()).is_ok());
+        assert!(ford.write(&"test-b".into(), "bar".into()).is_ok());
+
+        assert_eq!(
+            std::fs::read(path.join("test-a.json")).expect("could not read test data to verify"),
+            "foo\n".as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(path.join("test-b.json")).expect("could not read test data to verify"),
+            "bar\n".as_bytes()
+        );
+        assert!(path.is_dir());
+    }
+
+    struct TestDir<'a> {
+        path: &'a std::path::Path,
+    }
+
+    impl<'a> TestDir<'a> {
+        pub fn new(path: &'a str) -> TestDir<'a> {
+            let test_dir = TestDir {
+                path: std::path::Path::new(path),
+            };
+            if test_dir.path.is_dir() {
+                std::fs::remove_dir_all(test_dir.path)
+                    .expect("could not clean up test dir before starting");
+            }
+            // if it was a directory it doesn't exist anymore
+            if test_dir.path.exists() {
+                panic!("testing directory {:?} is not a directory", test_dir.path);
+            }
+            return test_dir;
+        }
+    }
+
+    impl<'a> Drop for TestDir<'a> {
+        fn drop(&mut self) {
+            if self.path.is_dir() {
+                std::fs::remove_dir_all(self.path)
+                    .expect("could not clean up test dir after tests");
+            }
         }
     }
 }
