@@ -56,7 +56,7 @@ struct Paging {
     unknown_fields: UnknownJSONFields,
 }
 
-type UnknownJSONFields = std::collections::HashMap<String, serde_json::Value>;
+type UnknownJSONFields = std::collections::BTreeMap<String, serde_json::Value>;
 
 #[derive(Debug)]
 enum GetEmojiError {
